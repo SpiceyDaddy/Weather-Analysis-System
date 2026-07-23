@@ -1,11 +1,16 @@
 import requests
 import json
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, filedialog
+import warnings
 import matplotlib.pyplot as plt
+from matplotlib.animation import FFMpegWriter, PillowWriter
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.dates as mdates
 import numpy as np
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from scipy.interpolate import griddata
 from datetime import datetime, timedelta, timezone
 import threading
 from PIL import Image, ImageTk, ImageSequence
@@ -34,6 +39,8 @@ US_STATE_ABBREVS = {
 LAT_MIN, LAT_MAX = 24.0, 50.0
 LON_MIN, LON_MAX = -125.0, -66.5
 ZOOM_WIDTH, ZOOM_HEIGHT = 300, 200
+SAT_DISPLAY_WIDTH, SAT_DISPLAY_HEIGHT = 840, 520
+IR_DISPLAY_WIDTH, IR_DISPLAY_HEIGHT = 840, 520
 
 # Local timezone
 try:
@@ -42,8 +49,63 @@ try:
 except:
     LOCAL_TZ = None
 
+# Rain timing animation configuration
+RAIN_EXTEND_INTO_NEXT_DAY = True
+RAIN_FADE_MINUTES = 45
+RAIN_FPS = 12
+RAIN_SIM_MINUTES_PER_FRAME = 15
+RAIN_WEST, RAIN_EAST = -90.6, -87.2
+RAIN_SOUTH, RAIN_NORTH = 34.9, 36.7
+RAIN_LONS = np.linspace(RAIN_WEST, RAIN_EAST, 120)
+RAIN_LATS = np.linspace(RAIN_SOUTH, RAIN_NORTH, 120)
+RAIN_LON_GRID, RAIN_LAT_GRID = np.meshgrid(RAIN_LONS, RAIN_LATS)
+RAIN_LAT_PTS = [35.05, 35.45, 35.9, 36.5]
+RAIN_START_PTS = [21*60, 20*60, 18*60, 17*60]
+clear_extra = 240 if RAIN_EXTEND_INTO_NEXT_DAY else 0
+
+
+def rain_start_time_at_lat(lat):
+    return np.interp(lat, RAIN_LAT_PTS, RAIN_START_PTS)
+
+
+def rain_clear_time_at_lat(lat):
+    base = rain_start_time_at_lat(lat) + 240
+    south_weight = np.clip((35.5 - lat) / (35.5 - 35.05), 0, 1)
+    return base + clear_extra * south_weight
+
+
+start_grid = rain_start_time_at_lat(RAIN_LAT_GRID)
+clear_grid = rain_clear_time_at_lat(RAIN_LAT_GRID)
+
+TOTAL_MINUTES = int(np.ceil((clear_grid.max() + RAIN_FADE_MINUTES) / 60) * 60)
+n_frames = int(TOTAL_MINUTES / RAIN_SIM_MINUTES_PER_FRAME) + 1
+
+
+def rain_intensity_field(now_min):
+    op = np.zeros_like(start_grid)
+    fading_in = (now_min >= start_grid - RAIN_FADE_MINUTES) & (now_min < start_grid)
+    op[fading_in] = (now_min - (start_grid[fading_in] - RAIN_FADE_MINUTES)) / RAIN_FADE_MINUTES
+    raining = (now_min >= start_grid) & (now_min < clear_grid)
+    op[raining] = 1.0
+    fading_out = (now_min >= clear_grid) & (now_min < clear_grid + RAIN_FADE_MINUTES)
+    op[fading_out] = 1.0 - (now_min - clear_grid[fading_out]) / RAIN_FADE_MINUTES
+    return op
+
+
+def rain_fmt_clock(total_min):
+    day_offset = int(total_min // 1440)
+    m = int(total_min % 1440)
+    h, mm = divmod(m, 60)
+    ampm = "PM" if h >= 12 else "AM"
+    h12 = h % 12 or 12
+    tag = " (next day)" if day_offset > 0 else ""
+    return f"{h12}:{mm:02d} {ampm}{tag}"
+
+
 def make_session():
     """Create requests session with retry logic"""
+    warnings.filterwarnings("ignore", category=UserWarning, module=r"cartopy\.io")
+    warnings.filterwarnings("ignore", category=Warning, module=r"cartopy\.io")
     s = requests.Session()
     retries = Retry(
         total=RETRY_TOTAL,
@@ -91,6 +153,30 @@ def crop_region(img, center_x, center_y, width, height):
     lower = min(center_y + height // 2, img.height)
     return img.crop((left, upper, right, lower))
 
+def get_moon_phase_name(dt):
+    """Return an approximate moon phase name for a date."""
+    if isinstance(dt, datetime):
+        dt = dt.astimezone(timezone.utc)
+    else:
+        dt = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+
+    diff = dt - datetime(2000, 1, 6, 18, 14, tzinfo=timezone.utc)
+    days = diff.total_seconds() / 86400.0
+    lunations = days / 29.53058867
+    phase = lunations - math.floor(lunations)
+    index = int((phase * 8) + 0.5) % 8
+    names = [
+        "New Moon",
+        "Waxing Crescent",
+        "First Quarter",
+        "Waxing Gibbous",
+        "Full Moon",
+        "Waning Gibbous",
+        "Last Quarter",
+        "Waning Crescent",
+    ]
+    return names[index]
+
 class WeatherAnalysisSystem:
     def __init__(self, root):
         self.root = root
@@ -116,6 +202,12 @@ class WeatherAnalysisSystem:
         self.ir_durations = []
         self.ir_frame_index = 0
         self.ir_anim_job = None
+        self.current_display_mode = None
+        self.hourly_forecast_data = None
+        self.rain_frame_times = []
+        self.rain_frame_arrays = []
+        self.rain_frame_index = 0
+        self.rain_preview_job = None
         
         # Build UI
         self._build_location_frame()
@@ -123,8 +215,8 @@ class WeatherAnalysisSystem:
         self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
 
         self._build_current_conditions_tab()
-        self._build_model_tab()
         self._build_satellite_tab()
+        self._build_weather_maps_tab()
         self._build_analysis_tab()
 
         # Initial data load
@@ -237,77 +329,273 @@ class WeatherAnalysisSystem:
             self.current_frame, wrap=tk.WORD, height=10)
         self.hourly_text.pack(fill='both', expand=True, padx=10, pady=(2,10))
 
-    def _build_model_tab(self):
-        """Model data with GRIB downloading and Open-Meteo"""
-        self.model_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.model_frame, text="Model Data")
-
-        # Controls
-        controls = tk.Frame(self.model_frame)
-        controls.pack(fill='x', padx=10, pady=6)
-        
-        tk.Label(controls, text="Forecast Hour:").pack(side='left')
-        self.hour_var = tk.StringVar(value="0")
-        hour_spin = tk.Spinbox(controls, from_=0, to=84, increment=3, 
-                              textvariable=self.hour_var, width=10)
-        hour_spin.pack(side='left', padx=5)
-        
-        tk.Button(controls, text="Load Open-Meteo", command=self.load_open_meteo).pack(side='left', padx=5)
-        
-        # Add zulu jump functionality
-        tk.Label(controls, text="Jump to Zulu Hour:").pack(side='left', padx=(20,5))
-        self.zulu_entry = tk.Entry(controls, width=12)
-        self.zulu_entry.pack(side='left', padx=2)
-        tk.Button(controls, text="Jump", command=self._jump_zulu).pack(side='left', padx=5)
-
-        # Display area
-        self.model_text = scrolledtext.ScrolledText(
-            self.model_frame, wrap=tk.WORD, height=35, font=("Courier", 9))
-        self.model_text.pack(fill='both', expand=True, padx=10, pady=8)
-
     def _build_satellite_tab(self):
-        """Enhanced satellite tab with IR zoom functionality"""
+        """Enhanced satellite tab with switchable national satellite and IR zoom."""
         self.sat_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.sat_frame, text="Satellite & IR")
 
-        # Controls
         controls = tk.Frame(self.sat_frame)
         controls.pack(fill='x', padx=10, pady=6)
-        
+
         self.sat_choice = ttk.Combobox(controls, values=[
             "GOES GeoColor", "GOES Infrared", "IR Zoom Regional"
-        ], width=20)
+        ], width=22, state="readonly")
         self.sat_choice.set("GOES GeoColor")
         self.sat_choice.pack(side='left', padx=6)
-        
-        tk.Button(controls, text="Load Satellite", command=self.load_satellite).pack(side='left', padx=6)
-        tk.Button(controls, text="Load IR Zoom", command=self.load_ir_zoom).pack(side='left', padx=6)
 
-        # Create frames for side-by-side display
-        display_frame = tk.Frame(self.sat_frame)
-        display_frame.pack(fill='both', expand=True, padx=10, pady=6)
+        tk.Button(controls, text="Load Selected View", command=self.load_selected_view).pack(side='left', padx=6)
 
-        # Left side - National satellite
-        left_frame = tk.Frame(display_frame)
-        left_frame.pack(side='left', fill='both', expand=True, padx=(0,5))
-        
-        tk.Label(left_frame, text="National Satellite", font=("Arial", 10, "bold")).pack()
-        self.sat_img_label = tk.Label(left_frame, text="National satellite image will appear here", 
-                                     bg="lightgray", width=40, height=20)
-        self.sat_img_label.pack(fill='both', expand=True, pady=(5,0))
+        self.sat_title_label = tk.Label(self.sat_frame, text="National Satellite", font=("Arial", 10, "bold"))
+        self.sat_title_label.pack(anchor='w', padx=10, pady=(4,0))
 
-        # Right side - Regional IR zoom
-        right_frame = tk.Frame(display_frame)
-        right_frame.pack(side='right', fill='both', expand=True, padx=(5,0))
-        
-        tk.Label(right_frame, text="Regional IR Zoom", font=("Arial", 10, "bold")).pack()
-        self.ir_zoom_label = tk.Label(right_frame, text="Regional IR zoom will appear here", 
-                                     bg="lightblue", width=40, height=20)
-        self.ir_zoom_label.pack(fill='both', expand=True, pady=(5,0))
+        self.sat_display_frame = tk.Frame(self.sat_frame, bg="black")
+        self.sat_display_frame.configure(width=SAT_DISPLAY_WIDTH, height=SAT_DISPLAY_HEIGHT)
+        self.sat_display_frame.pack(fill='both', expand=True, padx=10, pady=(5,0))
 
-        # Status/time labels
+        self.sat_display_label = tk.Label(
+            self.sat_display_frame,
+            text="Satellite or IR zoom image will appear here",
+            bg="black",
+            fg="white",
+            anchor='center',
+            justify='center'
+        )
+        self.sat_display_label.pack(fill='both', expand=True)
+        self.sat_display_frame.pack_propagate(False)
+
         self.sat_time_label = tk.Label(self.sat_frame, text="", anchor='w')
         self.sat_time_label.pack(fill='x', padx=12, pady=(5,8))
+
+    def _build_weather_maps_tab(self):
+        """Weather maps tab showing forecast temperature contours and rain timing"""
+        self.weather_maps_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.weather_maps_frame, text="Weather Maps")
+
+        self.weather_maps_notebook = ttk.Notebook(self.weather_maps_frame)
+        self.weather_maps_notebook.pack(fill='both', expand=True, padx=10, pady=10)
+
+        # Temperature map subtab
+        self.temp_tab = ttk.Frame(self.weather_maps_notebook)
+        self.weather_maps_notebook.add(self.temp_tab, text="Temperature Map")
+
+        temp_controls = tk.Frame(self.temp_tab)
+        temp_controls.pack(fill='x', padx=10, pady=6)
+        tk.Button(temp_controls, text="Load Temperature Map", command=self.load_weather_map).pack(side='left', padx=6)
+        self.weather_maps_status = tk.Label(temp_controls, text="", fg="green")
+        self.weather_maps_status.pack(side='left', padx=12)
+
+        self.weather_maps_fig = plt.Figure(figsize=(12, 8), tight_layout=True)
+        self.weather_maps_ax = self.weather_maps_fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+        self.weather_maps_canvas = FigureCanvasTkAgg(self.weather_maps_fig, self.temp_tab)
+        self.weather_maps_canvas.get_tk_widget().pack(fill='both', expand=True, padx=10, pady=10)
+
+        # Rain timing subtab
+        self.rain_tab = ttk.Frame(self.weather_maps_notebook)
+        self.weather_maps_notebook.add(self.rain_tab, text="Rain Timing")
+
+        rain_controls = tk.Frame(self.rain_tab)
+        rain_controls.pack(fill='x', padx=10, pady=6)
+        tk.Button(rain_controls, text="Render Rain Timing", command=self.load_rain_timing).pack(side='left', padx=6)
+        self.rain_save_button = tk.Button(rain_controls, text="Save Rain Animation...", command=self.save_rain_timing, state='disabled')
+        self.rain_save_button.pack(side='left', padx=6)
+        self.rain_status_label = tk.Label(rain_controls, text="", fg="green")
+        self.rain_status_label.pack(side='left', padx=12)
+
+        self.rain_fig = plt.Figure(figsize=(12, 8), tight_layout=True)
+        self.rain_ax = self.rain_fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+        self.rain_canvas = FigureCanvasTkAgg(self.rain_fig, self.rain_tab)
+        self.rain_canvas.get_tk_widget().pack(fill='both', expand=True, padx=10, pady=10)
+
+    def load_selected_view(self):
+        choice = self.sat_choice.get()
+        if "IR Zoom" in choice:
+            self.load_ir_zoom()
+        else:
+            self.load_satellite()
+
+    def load_weather_map(self):
+        """Load temperature contour map using Open-Meteo forecast data"""
+        self.weather_maps_status.config(text="Loading temperature map...", fg="orange")
+        threading.Thread(target=self._load_weather_map_thread, daemon=True).start()
+
+    def _load_weather_map_thread(self):
+        lats = np.arange(25, 50, 3)
+        lons = np.arange(-125, -65, 3)
+        lat_grid, lon_grid = np.meshgrid(lats, lons)
+        lat_flat = lat_grid.flatten()
+        lon_flat = lon_grid.flatten()
+
+        temps = []
+        for lat, lon in zip(lat_flat, lon_flat):
+            url = "https://api.open-meteo.com/v1/forecast"
+            params = {
+                "latitude": float(lat),
+                "longitude": float(lon),
+                "hourly": "temperature_2m",
+                "forecast_days": 1,
+                "temperature_unit": "fahrenheit"
+            }
+            data, err = safe_get_json(url, params=params)
+            if err or not data:
+                self.root.after(0, lambda: self.weather_maps_status.config(text=f"Map load failed: {err or 'no data'}", fg="red"))
+                return
+            temps.append(data.get("hourly", {}).get("temperature_2m", [None])[12])
+
+        temps = np.array(temps, dtype=float)
+
+        grid_lon, grid_lat = np.meshgrid(
+            np.linspace(lons.min(), lons.max(), 200),
+            np.linspace(lats.min(), lats.max(), 200)
+        )
+        grid_temp = griddata(
+            (lon_flat, lat_flat), temps,
+            (grid_lon, grid_lat), method='cubic'
+        )
+
+        def plot_map():
+            self.weather_maps_ax.clear()
+            self.weather_maps_ax.set_title('Interpolated Temperature Forecast')
+            self.weather_maps_ax.set_extent([-125, -65, 25, 50], crs=ccrs.PlateCarree())
+            self.weather_maps_ax.add_feature(cfeature.COASTLINE)
+            self.weather_maps_ax.add_feature(cfeature.BORDERS)
+            self.weather_maps_ax.add_feature(cfeature.STATES, linestyle=':')
+            self.weather_maps_ax.add_feature(cfeature.OCEAN, zorder=10, facecolor='white')
+
+            contour = self.weather_maps_ax.contourf(
+                grid_lon, grid_lat, grid_temp, levels=20,
+                cmap='coolwarm', transform=ccrs.PlateCarree(), alpha=0.85
+            )
+            self.weather_maps_fig.colorbar(contour, orientation='horizontal', pad=0.05, label='Temperature (°F)')
+            self.weather_maps_canvas.draw()
+            self.weather_maps_status.config(text='Temperature map loaded', fg='green')
+
+        self.root.after(0, plot_map)
+
+    def _cancel_rain_preview(self):
+        if self.rain_preview_job:
+            try:
+                self.root.after_cancel(self.rain_preview_job)
+            except tk.TclError:
+                pass
+            self.rain_preview_job = None
+
+    def load_rain_timing(self):
+        """Prepare rain timing preview and enable saving."""
+        self.rain_status_label.config(text="Rendering rain timing preview...", fg="orange")
+        self.rain_save_button.config(state='disabled')
+        self._cancel_rain_preview()
+        threading.Thread(target=self._load_rain_timing_thread, daemon=True).start()
+
+    def _load_rain_timing_thread(self):
+        try:
+            self.rain_frame_times = [i * RAIN_SIM_MINUTES_PER_FRAME for i in range(n_frames)]
+            self.rain_frame_arrays = [rain_intensity_field(t) for t in self.rain_frame_times]
+            self.rain_frame_index = 0
+            self.root.after(0, self._start_rain_preview)
+        except Exception as e:
+            self.root.after(0, lambda: self.rain_status_label.config(text=f"Rain preview failed: {e}", fg="red"))
+
+    def _start_rain_preview(self):
+        self.rain_save_button.config(state='normal')
+        self.rain_status_label.config(text="Rain timing preview ready", fg="green")
+        self._draw_rain_frame_preview()
+
+    def _draw_rain_frame_preview(self):
+        if not self.rain_frame_arrays:
+            return
+
+        now_min = self.rain_frame_times[self.rain_frame_index]
+        self.rain_ax.clear()
+        self.rain_ax.set_extent([RAIN_WEST, RAIN_EAST, RAIN_SOUTH, RAIN_NORTH], crs=ccrs.PlateCarree())
+        self.rain_ax.add_feature(cfeature.COASTLINE)
+        self.rain_ax.add_feature(cfeature.BORDERS)
+        self.rain_ax.add_feature(cfeature.STATES, linestyle=':')
+
+        self.rain_ax.contourf(
+            RAIN_LON_GRID,
+            RAIN_LAT_GRID,
+            self.rain_frame_arrays[self.rain_frame_index],
+            levels=20,
+            cmap='Blues',
+            vmin=0,
+            vmax=1,
+            alpha=0.85,
+            transform=ccrs.PlateCarree()
+        )
+        self.rain_ax.set_title(f'Rain Timing — West Tennessee   |   {rain_fmt_clock(now_min)}')
+        self.rain_canvas.draw_idle()
+
+        self.rain_frame_index = (self.rain_frame_index + 1) % len(self.rain_frame_arrays)
+        self.rain_preview_job = self.root.after(int(1000 / RAIN_FPS), self._draw_rain_frame_preview)
+
+    def save_rain_timing(self):
+        if not self.rain_frame_arrays:
+            self.rain_status_label.config(text="Render the rain timing preview first", fg="red")
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".mp4",
+            filetypes=[("MP4 video", "*.mp4"), ("GIF animation", "*.gif")],
+            title="Save Rain Timing Animation"
+        )
+        if not path:
+            return
+
+        self.rain_status_label.config(text="Saving rain animation...", fg="orange")
+        threading.Thread(target=self._save_rain_timing_thread, args=(path,), daemon=True).start()
+
+    def _save_rain_timing_thread(self, path):
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+        ext = os.path.splitext(path)[1].lower()
+        primary_writer = FFMpegWriter(fps=RAIN_FPS, bitrate=1800) if ext == '.mp4' else PillowWriter(fps=RAIN_FPS)
+
+        def build_frame(now_min):
+            ax.clear()
+            ax.set_extent([RAIN_WEST, RAIN_EAST, RAIN_SOUTH, RAIN_NORTH], crs=ccrs.PlateCarree())
+            ax.add_feature(cfeature.COASTLINE)
+            ax.add_feature(cfeature.BORDERS)
+            ax.add_feature(cfeature.STATES, linestyle=':')
+            ax.contourf(
+                RAIN_LON_GRID,
+                RAIN_LAT_GRID,
+                rain_intensity_field(now_min),
+                levels=20,
+                cmap='Blues',
+                vmin=0,
+                vmax=1,
+                alpha=0.85,
+                transform=ccrs.PlateCarree()
+            )
+            ax.set_title(f'Rain Timing — West Tennessee   |   {rain_fmt_clock(now_min)}')
+
+        try:
+            with primary_writer.saving(fig, path, dpi=100):
+                for now_min in self.rain_frame_times:
+                    build_frame(now_min)
+                    primary_writer.grab_frame()
+            plt.close(fig)
+            self.root.after(0, lambda: self.rain_status_label.config(text=f"Saved animation to {os.path.basename(path)}", fg='green'))
+            return
+        except Exception as e:
+            if ext == '.mp4':
+                gif_path = os.path.splitext(path)[0] + '.gif'
+                try:
+                    fallback_writer = PillowWriter(fps=RAIN_FPS)
+                    with fallback_writer.saving(fig, gif_path, dpi=100):
+                        for now_min in self.rain_frame_times:
+                            build_frame(now_min)
+                            fallback_writer.grab_frame()
+                    plt.close(fig)
+                    self.root.after(0, lambda: self.rain_status_label.config(
+                        text=f"MP4 save failed, saved GIF instead: {os.path.basename(gif_path)}", fg='green'))
+                    return
+                except Exception as e2:
+                    plt.close(fig)
+                    self.root.after(0, lambda: self.rain_status_label.config(text=f"Save failed: {e2}", fg='red'))
+                    return
+            plt.close(fig)
+            self.root.after(0, lambda: self.rain_status_label.config(text=f"Save failed: {e}", fg='red'))
 
     def _build_analysis_tab(self):
         """Analysis charts and graphs"""
@@ -350,40 +638,13 @@ class WeatherAnalysisSystem:
             return
 
         hourly = data.get("hourly", {})
-        times = hourly.get("time", [])
-        
-        if not times:
+        if not hourly.get("time"):
+            self.root.after(0, lambda: self.status_label.config(text="Open-Meteo returned no data", fg="red"))
             return
 
-        # Build table
-        output = f"=== OPEN-METEO FORECAST ===\n"
-        output += f"Location: {lat:.4f}, {lon:.4f}\n\n"
-        output += f"{'Time (UTC)':<20} {'Temp(°C)':<10} {'RH(%)':<8} {'Press(hPa)':<12} {'Wind(m/s)':<10} {'Precip(mm)':<10}\n"
-        output += "-" * 80 + "\n"
-
-        temps = hourly.get("temperature_2m", [])
-        rh = hourly.get("relativehumidity_2m", [])
-        pressure = hourly.get("pressure_msl", [])
-        wind = hourly.get("windspeed_10m", [])
-        precip = hourly.get("precipitation", [])
-
-        for i, time_str in enumerate(times[:48]):  # Next 48 hours
-            dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
-            time_display = dt.strftime('%m-%d %H:%M')
-            
-            temp_val = f"{temps[i]:.1f}" if i < len(temps) and temps[i] is not None else "N/A"
-            rh_val = f"{rh[i]:.0f}" if i < len(rh) and rh[i] is not None else "N/A"
-            press_val = f"{pressure[i]:.1f}" if i < len(pressure) and pressure[i] is not None else "N/A"
-            wind_val = f"{wind[i]:.1f}" if i < len(wind) and wind[i] is not None else "N/A"
-            precip_val = f"{precip[i]:.1f}" if i < len(precip) and precip[i] is not None else "0.0"
-            
-            output += f"{time_display:<20} {temp_val:<10} {rh_val:<8} {press_val:<12} {wind_val:<10} {precip_val:<10}\n"
-
-        self.root.after(0, lambda: (
-            self.model_text.delete(1.0, tk.END),
-            self.model_text.insert(tk.END, output),
-            self.status_label.config(text="Open-Meteo loaded", fg="green")
-        ))
+        self.hourly_forecast_data = hourly
+        self.root.after(0, lambda: self.status_label.config(text="Open-Meteo loaded", fg="green"))
+        self.root.after(0, self.update_analysis_charts)
 
     def _jump_zulu(self):
         """Jump to specific Zulu hour in model data"""
@@ -423,6 +684,10 @@ class WeatherAnalysisSystem:
     # Satellite Methods
     def load_satellite(self):
         """Load national satellite imagery"""
+        self._cancel_all_animation()
+        self.current_display_mode = 'sat'
+        self.sat_title_label.config(text="National Satellite")
+        self.sat_display_label.config(text="Loading satellite imagery...", image="", bg="black")
         threading.Thread(target=self._load_sat_thread, daemon=True).start()
 
     def _load_sat_thread(self):
@@ -436,7 +701,7 @@ class WeatherAnalysisSystem:
 
         data, err = safe_get_bytes(url, timeout=20)
         if err:
-            self.root.after(0, lambda: self.sat_img_label.config(text=f"Satellite error: {err}"))
+            self.root.after(0, lambda: self.sat_display_label.config(text=f"Satellite error: {err}", image=""))
             return
 
         try:
@@ -447,7 +712,7 @@ class WeatherAnalysisSystem:
             for frame in ImageSequence.Iterator(img):
                 f = frame.convert("RGBA")
                 # Resize for display
-                f = f.resize((400, 240), Image.Resampling.LANCZOS)
+                f = f.resize((SAT_DISPLAY_WIDTH, SAT_DISPLAY_HEIGHT), Image.Resampling.LANCZOS)
                 tk_img = ImageTk.PhotoImage(f)
                 frames.append(tk_img)
                 durations.append(frame.info.get("duration", 500))
@@ -462,15 +727,16 @@ class WeatherAnalysisSystem:
             
             def start_animation():
                 if self.sat_frames:
-                    self.sat_img_label.config(image=self.sat_frames[0], text="")
-                    self.sat_img_label.image = self.sat_frames[0]
+                    self.current_display_mode = 'sat'
+                    self.sat_display_label.config(image=self.sat_frames[0], text="")
+                    self.sat_display_label.image = self.sat_frames[0]
                     self.sat_time_label.config(text=f"National Satellite: {time_str}")
                     self._animate_satellite()
 
             self.root.after(0, start_animation)
 
         except Exception as e:
-            self.root.after(0, lambda: self.sat_img_label.config(text=f"Image error: {e}"))
+            self.root.after(0, lambda: self.sat_display_label.config(text=f"Image error: {e}", image=""))
 
     def _animate_satellite(self):
         """Animate national satellite frames"""
@@ -479,29 +745,53 @@ class WeatherAnalysisSystem:
 
         try:
             frame = self.sat_frames[self.sat_frame_index]
-            self.sat_img_label.config(image=frame, text="")
-            self.sat_img_label.image = frame
-        except:
+            self.sat_display_label.config(image=frame, text="")
+            self.sat_display_label.image = frame
+        except Exception:
             pass
 
         # Schedule next frame
         duration = self.sat_durations[self.sat_frame_index] if self.sat_frame_index < len(self.sat_durations) else 500
         self.sat_frame_index = (self.sat_frame_index + 1) % len(self.sat_frames)
         
-        if self.sat_anim_job:
-            self.root.after_cancel(self.sat_anim_job)
         self.sat_anim_job = self.root.after(duration, self._animate_satellite)
 
     def load_ir_zoom(self):
         """Load IR zoom for current location"""
+        self._cancel_all_animation()
+        self.current_display_mode = 'ir'
+        self.sat_title_label.config(text="Regional IR Zoom")
+        self.sat_display_label.config(text="Loading IR zoom...", image="", bg="black")
         threading.Thread(target=self._load_ir_thread, daemon=True).start()
+
+    def _cancel_sat_animation(self):
+        if self.sat_anim_job:
+            try:
+                self.root.after_cancel(self.sat_anim_job)
+            except tk.TclError:
+                pass
+            self.sat_anim_job = None
+
+    def _cancel_ir_animation(self):
+        if self.ir_anim_job:
+            try:
+                self.root.after_cancel(self.ir_anim_job)
+            except tk.TclError:
+                pass
+            self.ir_anim_job = None
+
+    def _cancel_all_animation(self):
+        self._cancel_sat_animation()
+        self._cancel_ir_animation()
+        self.sat_frames = []
+        self.ir_frames = []
 
     def _load_ir_thread(self):
         """Load IR zoom data in background - integrating test.py functionality"""
         try:
             lat, lon = map(float, self.location.split(','))
         except:
-            self.root.after(0, lambda: self.ir_zoom_label.config(text="Invalid coordinates"))
+            self.root.after(0, lambda: self.sat_display_label.config(text="Invalid coordinates", image=""))
             return
 
         # Load GOES IR CONUS GIF (same as test.py)
@@ -509,7 +799,7 @@ class WeatherAnalysisSystem:
         data, err = safe_get_bytes(url, timeout=20)
         
         if err:
-            self.root.after(0, lambda: self.ir_zoom_label.config(text=f"IR load error: {err}"))
+            self.root.after(0, lambda: self.sat_display_label.config(text=f"IR load error: {err}", image=""))
             return
 
         try:
@@ -529,7 +819,7 @@ class WeatherAnalysisSystem:
                 cropped = crop_region(f, center_x, center_y, ZOOM_WIDTH, ZOOM_HEIGHT)
                 
                 # Resize for better display
-                cropped = cropped.resize((300, 200), Image.Resampling.LANCZOS)
+                cropped = cropped.resize((IR_DISPLAY_WIDTH, IR_DISPLAY_HEIGHT), Image.Resampling.LANCZOS)
                 tk_img = ImageTk.PhotoImage(cropped)
                 frames.append(tk_img)
                 durations.append(frame.info.get("duration", 500))
@@ -538,17 +828,17 @@ class WeatherAnalysisSystem:
             self.ir_durations = durations
             self.ir_frame_index = 0
 
-            # Start IR animation
+                # Start IR animation
             def start_ir_animation():
                 if self.ir_frames:
-                    self.ir_zoom_label.config(image=self.ir_frames[0], text="")
-                    self.ir_zoom_label.image = self.ir_frames[0]
+                    self.sat_display_label.config(image=self.ir_frames[0], text="")
+                    self.sat_display_label.image = self.ir_frames[0]
                     self._animate_ir_zoom()
 
             self.root.after(0, start_ir_animation)
 
         except Exception as e:
-            self.root.after(0, lambda: self.ir_zoom_label.config(text=f"IR processing error: {e}"))
+            self.root.after(0, lambda: self.sat_display_label.config(text=f"IR processing error: {e}", image=""))
 
     def _animate_ir_zoom(self):
         """Animate IR zoom frames"""
@@ -557,8 +847,8 @@ class WeatherAnalysisSystem:
 
         try:
             frame = self.ir_frames[self.ir_frame_index]
-            self.ir_zoom_label.config(image=frame, text="")
-            self.ir_zoom_label.image = frame
+            self.sat_display_label.config(image=frame, text="")
+            self.sat_display_label.image = frame
         except:
             pass
 
@@ -566,12 +856,6 @@ class WeatherAnalysisSystem:
         duration = self.ir_durations[self.ir_frame_index] if self.ir_frame_index < len(self.ir_durations) else 500
         self.ir_frame_index = (self.ir_frame_index + 1) % len(self.ir_frames)
         
-        # Schedule next frame
-        duration = self.ir_durations[self.ir_frame_index] if self.ir_frame_index < len(self.ir_durations) else 500
-        self.ir_frame_index = (self.ir_frame_index + 1) % len(self.ir_frames)
-        
-        if self.ir_anim_job:
-            self.root.after_cancel(self.ir_anim_job)
         self.ir_anim_job = self.root.after(duration, self._animate_ir_zoom)
 
     # NWS Data Methods
@@ -685,15 +969,62 @@ class WeatherAnalysisSystem:
                 
                 # Get forecast
                 forecast_data, err = safe_get_json(forecast_url)
-                if not err:
-                    output += "\n=== FORECAST ===\n"
-                    periods = forecast_data['properties']['periods'][:6]
+                if not err and forecast_data:
+                    output += "\n=== 8-DAY FORECAST ===\n"
+                    periods = forecast_data['properties'].get('periods', [])
+                    daily = {}
+
                     for period in periods:
-                        output += f"\n{period['name']}:\n"
-                        output += f"Temperature: {period['temperature']}°{period['temperatureUnit']}\n"
-                        output += f"Wind: {period.get('windSpeed', 'N/A')} {period.get('windDirection', '')}\n"
-                        output += f"{period['detailedForecast']}\n"
-                
+                        start_time = period.get('startTime')
+                        try:
+                            dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                        except Exception:
+                            continue
+
+                        date_key = dt.date()
+                        if date_key not in daily:
+                            daily[date_key] = {
+                                'day': None,
+                                'night': None,
+                                'unit': period.get('temperatureUnit', 'F'),
+                                'moon': get_moon_phase_name(dt),
+                            }
+
+                        entry = {
+                            'temp': period.get('temperature'),
+                            'wind': period.get('windSpeed', 'N/A'),
+                            'precip': period.get('probabilityOfPrecipitation', {}).get('value')
+                                     if isinstance(period.get('probabilityOfPrecipitation'), dict) else period.get('probabilityOfPrecipitation'),
+                            'conds': period.get('shortForecast', period.get('detailedForecast', 'N/A')),
+                        }
+
+                        if period.get('isDaytime'):
+                            daily[date_key]['day'] = entry
+                        else:
+                            daily[date_key]['night'] = entry
+
+                    dates = sorted(daily.keys())[:8]
+                    for date_key in dates:
+                        entry = daily[date_key]
+                        date_str = date_key.strftime('%a %m/%d')
+                        output += f"\n{date_str} — Moon: {entry['moon']}\n"
+
+                        day = entry['day']
+                        night = entry['night']
+                        unit = entry['unit']
+
+                        if day:
+                            day_precip = f"{int(day['precip'])}%" if isinstance(day['precip'], (int, float)) else str(day['precip'] or 'N/A')
+                            output += f"Day: High {day['temp']}°{unit}, Wind {day['wind']}, Precip {day_precip}, {day['conds']}\n"
+                        else:
+                            output += "Day: No data available\n"
+
+                        if night:
+                            night_precip = f"{int(night['precip'])}%" if isinstance(night['precip'], (int, float)) else str(night['precip'] or 'N/A')
+                            output += f"Night: Low {night['temp']}°{unit}, Wind {night['wind']}, Precip {night_precip}, {night['conds']}\n"
+                        else:
+                            output += "Night: No data available\n"
+
                 return output
         
         return "No observation data available"
@@ -747,34 +1078,58 @@ class WeatherAnalysisSystem:
         for ax in [self.ax1, self.ax2, self.ax3, self.ax4]:
             ax.clear()
 
-        # Generate sample data or use model data if available
-        now = datetime.now(timezone.utc)
-        hours = [now + timedelta(hours=i) for i in range(48)]
-        
+        hours = []
+        temp_data = []
+        pressure_data = []
+        wind_data = []
+        humidity_data = []
+
+        if self.hourly_forecast_data and self.hourly_forecast_data.get('time'):
+            times = self.hourly_forecast_data.get('time', [])
+            temp_data_c = self.hourly_forecast_data.get('temperature_2m', [])
+            pressure_data_hpa = self.hourly_forecast_data.get('pressure_msl', [])
+            wind_data_ms = self.hourly_forecast_data.get('windspeed_10m', [])
+            humidity_data_pct = self.hourly_forecast_data.get('relativehumidity_2m', [])
+
+            for i, time_str in enumerate(times[:48]):
+                try:
+                    dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+                except Exception:
+                    continue
+                hours.append(dt)
+                temp_data.append(temp_data_c[i] * 9/5 + 32 if i < len(temp_data_c) and temp_data_c[i] is not None else None)
+                pressure_data.append(pressure_data_hpa[i] if i < len(pressure_data_hpa) and pressure_data_hpa[i] is not None else None)
+                wind_data.append(wind_data_ms[i] * 2.237 if i < len(wind_data_ms) and wind_data_ms[i] is not None else None)
+                humidity_data.append(humidity_data_pct[i] if i < len(humidity_data_pct) and humidity_data_pct[i] is not None else None)
+
+        if not hours:
+            now = datetime.now(timezone.utc)
+            hours = [now + timedelta(hours=i) for i in range(48)]
+            temp_data = [70 + 15 * math.sin(i * math.pi / 12) + np.random.normal(0, 2) for i in range(48)]
+            pressure_data = [1013 + 8 * math.sin(i * math.pi / 24) + np.random.normal(0, 3) for i in range(48)]
+            wind_data = [abs(8 + 5 * math.sin(i * math.pi / 16) + np.random.normal(0, 2)) for i in range(48)]
+            humidity_data = [max(0, min(100, 60 + 25 * math.sin(i * math.pi / 12 + math.pi/4) + np.random.normal(0, 5))) for i in range(48)]
+
         # Temperature trend
-        temp_data = [70 + 15 * math.sin(i * math.pi / 12) + np.random.normal(0, 2) for i in range(48)]
         self.ax1.plot(hours, temp_data, 'r-', linewidth=2, marker='o', markersize=3)
         self.ax1.set_title('Temperature Trend (48h)')
         self.ax1.set_ylabel('Temperature (°F)')
         self.ax1.grid(True, alpha=0.3)
 
         # Pressure trend
-        pressure_data = [1013 + 8 * math.sin(i * math.pi / 24) + np.random.normal(0, 3) for i in range(48)]
         self.ax2.plot(hours, pressure_data, 'b-', linewidth=2, marker='s', markersize=3)
         self.ax2.set_title('Pressure Trend (48h)')
-        self.ax2.set_ylabel('Pressure (mb)')
+        self.ax2.set_ylabel('Pressure (hPa)')
         self.ax2.grid(True, alpha=0.3)
 
         # Wind speed
-        wind_data = [abs(8 + 5 * math.sin(i * math.pi / 16) + np.random.normal(0, 2)) for i in range(48)]
         self.ax3.plot(hours, wind_data, 'g-', linewidth=2, marker='^', markersize=3)
         self.ax3.set_title('Wind Speed (48h)')
         self.ax3.set_ylabel('Speed (mph)')
         self.ax3.grid(True, alpha=0.3)
 
         # Humidity
-        humidity_data = [60 + 25 * math.sin(i * math.pi / 12 + math.pi/4) + np.random.normal(0, 5) for i in range(48)]
-        humidity_data = [max(0, min(100, h)) for h in humidity_data]  # Clamp 0-100
+        humidity_data = [max(0, min(100, h)) if h is not None else None for h in humidity_data]
         self.ax4.plot(hours, humidity_data, 'm-', linewidth=2, marker='d', markersize=3)
         self.ax4.set_title('Relative Humidity (48h)')
         self.ax4.set_ylabel('Humidity (%)')
@@ -820,7 +1175,7 @@ class WeatherAnalysisSystem:
                 ))
                 
                 # Update analysis
-                self.root.after(0, self.update_analysis_charts)
+                self.load_open_meteo()
                 
                 self.root.after(0, lambda: self.status_label.config(
                     text=f"Refreshed at {datetime.now().strftime('%H:%M:%S')}", fg="green"))
